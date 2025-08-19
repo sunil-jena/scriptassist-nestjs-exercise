@@ -1,18 +1,27 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { Injectable, InternalServerErrorException, NotFoundException } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+  Logger,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, In, Repository } from 'typeorm';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
-import { InjectQueue } from '@nestjs/bullmq';
-import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
 
 @Injectable()
 export class TasksService {
+  private readonly logger = new Logger(TasksService.name);
+
   constructor(
+    private readonly dataSource: DataSource,
     @InjectRepository(Task)
     private readonly tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
@@ -20,20 +29,43 @@ export class TasksService {
   ) {}
 
   async create(createTaskDto: CreateTaskDto): Promise<Task> {
-    // Inefficient implementation: creates the task but doesn't use a single transaction
-    // for creating and adding to queue, potential for inconsistent state
-    try {
-      const task = this.tasksRepository.create(createTaskDto);
-      const savedTask = await this.tasksRepository.save(task);
+    const qr = this.dataSource.createQueryRunner();
+    await qr.connect();
+    await qr.startTransaction();
 
-      await this.taskQueue.add('task-status-update', {
-        taskId: savedTask.id,
-        status: savedTask.status,
+    try {
+      const repo = qr.manager.getRepository(Task);
+      const entity = repo.create(createTaskDto);
+      const saved = await repo.save(entity);
+
+      await qr.commitTransaction();
+
+      try {
+        await this.taskQueue.add(
+          'task-status-update',
+          { taskId: saved.id, status: saved.status },
+          {
+            jobId: `task-status-${saved.id}-${Date.now()}`,
+            attempts: 5,
+            backoff: { type: 'exponential', delay: 5_000 },
+            removeOnComplete: 1000,
+            removeOnFail: 5000,
+          },
+        );
+      } catch (queueErr) {
+        this.logger.warn(`Queue enqueue failed for task ${saved.id}: ${queueErr}`);
+      }
+
+      return await this.tasksRepository.findOneOrFail({
+        where: { id: saved.id },
+        relations: ['user'],
       });
-      return savedTask;
     } catch (error) {
-      console.error('Error creating task:', error);
+      await qr.rollbackTransaction();
+      this.logger.error('Error creating task', error as Error);
       throw new InternalServerErrorException('Failed to create task');
+    } finally {
+      await qr.release();
     }
   }
 
@@ -42,26 +74,35 @@ export class TasksService {
     priority?: TaskPriority,
     page?: number,
     limit?: number,
-  ): Promise<{ data: Task[]; total: number; page: number; limit: number; totalPages: number }> {
+  ): Promise<{
+    data: Task[];
+    total: number;
+    page: number;
+    limit: number;
+    totalPages: number;
+  }> {
     try {
       const pageNum = Number(page) > 0 ? Number(page) : 1;
-      const limitNum = Number(limit) > 0 ? Number(limit) : 10;
-      const query = this.tasksRepository
+      const limitNum = Math.min(Math.max(Number(limit) || 10, 1), 100);
+
+      const qb = this.tasksRepository
         .createQueryBuilder('task')
         .leftJoinAndSelect('task.user', 'user')
         .orderBy('task.createdAt', 'DESC')
+        .addOrderBy('task.id', 'DESC')
         .skip((pageNum - 1) * limitNum)
         .take(limitNum);
 
       if (status) {
-        query.andWhere('task.status = :status', { status });
+        qb.andWhere('task.status = :status', { status });
       }
 
       if (priority) {
-        query.andWhere('task.priority = :priority', { priority });
+        qb.andWhere('task.priority = :priority', { priority });
       }
 
-      const [data, total] = await query.getManyAndCount();
+      const [data, total] = await qb.getManyAndCount();
+
       return {
         data,
         total,
@@ -70,21 +111,14 @@ export class TasksService {
         totalPages: Math.ceil(total / limitNum),
       };
     } catch (error) {
-      console.error('Database error in findAll:', error);
+      this.logger.error('Database error in findAll', error as Error);
       throw new InternalServerErrorException('Could not retrieve tasks');
     }
   }
 
   async findOne(id: string): Promise<Task> {
-    // Inefficient implementation: two separate database calls
-    // const count = await this.tasksRepository.count({ where: { id } });
-
-    // if (count === 0) {
-    //   throw new NotFoundException(`Task with ID ${id} not found`);
-    // }
-
     try {
-      const task: Task | null = await this.tasksRepository.findOne({
+      const task = await this.tasksRepository.findOne({
         where: { id },
         relations: ['user'],
       });
@@ -93,97 +127,108 @@ export class TasksService {
         throw new NotFoundException(`Task with ID ${id} not found`);
       }
 
-      return task as Task;
+      return task;
     } catch (error) {
-      console.error(`Error fetching task with ID ${id}:`, error);
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(`Error fetching task with ID ${id}`, error as Error);
       throw new InternalServerErrorException('Failed to fetch task');
     }
-    // return (await this.tasksRepository.findOne({
-    //   where: { id },
-    //   relations: ['user'],
-    // })) as Task;
   }
 
   async update(id: string, updateTaskDto: UpdateTaskDto): Promise<Task> {
-    // Inefficient implementation: multiple database calls
-    // and no transaction handling
+    const qr = this.dataSource.createQueryRunner();
+    await qr.connect();
+    await qr.startTransaction();
+
     try {
-      const task: Task | null = await this.tasksRepository.findOne({ where: { id } });
+      const repo = qr.manager.getRepository(Task);
+      const task = await repo.findOne({ where: { id } });
+      if (!task) throw new NotFoundException(`Task with ID ${id} not found`);
 
-      if (!task) {
-        throw new NotFoundException(`Task with ID ${id} not found`);
-      }
-
-      const originalStatus: TaskStatus = task.status;
-
+      const prevStatus = task.status;
       Object.assign(task, updateTaskDto);
 
-      const updatedTask: Task = await this.tasksRepository.save(task);
+      await repo.save(task);
+      await qr.commitTransaction();
 
-      // If status changed, add to queue
-      if (originalStatus !== updatedTask.status) {
+      if (prevStatus !== task.status) {
         try {
-          await this.taskQueue.add('task-status-update', {
-            taskId: updatedTask.id,
-            status: updatedTask.status,
-          });
-        } catch (queueError: unknown) {
-          console.error(`Failed to enqueue task update for ID ${id}:`, queueError);
+          await this.taskQueue.add(
+            'task-status-update',
+            { taskId: task.id, status: task.status },
+            {
+              jobId: `task-status-${task.id}-${Date.now()}`,
+              attempts: 5,
+              backoff: { type: 'exponential', delay: 5_000 },
+              removeOnComplete: 1000,
+              removeOnFail: 5000,
+            },
+          );
+        } catch (queueErr) {
+          this.logger.warn(`Failed to enqueue task update for ID ${id}: ${queueErr}`);
         }
       }
 
-      return updatedTask;
-    } catch (error: unknown) {
-      console.error(`Error updating task with ID ${id}:`, error);
+      return await this.tasksRepository.findOneOrFail({ where: { id }, relations: ['user'] });
+    } catch (error) {
+      await qr.rollbackTransaction();
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(`Error updating task with ID ${id}`, error as Error);
       throw new InternalServerErrorException('Failed to update task');
+    } finally {
+      await qr.release();
     }
   }
 
   async remove(id: string): Promise<void> {
-    // Inefficient implementation: two separate database calls
     try {
       const result = await this.tasksRepository.delete(id);
-
-      if (result.affected === 0) {
+      if (!result.affected) {
         throw new NotFoundException(`Task with ID ${id} not found`);
       }
-    } catch (error: unknown) {
-      console.error(`Error deleting task with ID ${id}:`, error);
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(`Error deleting task with ID ${id}`, error as Error);
       throw new InternalServerErrorException('Failed to delete task');
     }
   }
 
   async findByStatus(status: TaskStatus): Promise<Task[]> {
-    // Inefficient implementation: doesn't use proper repository patterns
     try {
-      return await this.tasksRepository.find({
-        where: { status },
-        relations: ['user'],
-      });
-    } catch (error: unknown) {
-      console.error(`Error finding tasks by status ${status}:`, error);
+      return await this.tasksRepository
+        .createQueryBuilder('task')
+        .leftJoinAndSelect('task.user', 'user')
+        .where('task.status = :status', { status })
+        .orderBy('task.createdAt', 'DESC')
+        .addOrderBy('task.id', 'DESC')
+        .getMany();
+    } catch (error) {
+      this.logger.error(`Error finding tasks by status ${status}`, error as Error);
       throw new InternalServerErrorException('Failed to fetch tasks by status');
     }
   }
 
   async updateStatus(id: string, status: string): Promise<Task> {
-    // This method will be called by the task processor
     try {
-      const task: Task | null = await this.tasksRepository.findOne({
+      const res = await this.tasksRepository
+        .createQueryBuilder()
+        .update(Task)
+        .set({ status: status as TaskStatus })
+        .where('id = :id', { id })
+        .returning('*')
+        .execute();
+
+      if (!res.affected) throw new NotFoundException(`Task with ID ${id} not found`);
+
+      const updated = await this.tasksRepository.findOne({
         where: { id },
         relations: ['user'],
       });
-
-      if (!task) {
-        throw new NotFoundException(`Task with ID ${id} not found`);
-      }
-      task.status = status as TaskStatus;
-      return await this.tasksRepository.save(task);
-    } catch (error: unknown) {
-      if (error instanceof NotFoundException) {
-        throw error;
-      }
-      console.error(`Error updating status for task ${id}:`, error);
+      if (!updated) throw new NotFoundException(`Task with ID ${id} not found after update`);
+      return updated;
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      this.logger.error(`Error updating status for task ${id}`, error as Error);
       throw new InternalServerErrorException('Failed to update task status');
     }
   }
@@ -195,27 +240,30 @@ export class TasksService {
     const success: string[] = [];
     const failed: { id: string; error: string }[] = [];
 
+    if (!taskIds?.length) return { success, failed };
+
     try {
-      const tasks = await this.tasksRepository.findByIds(taskIds);
+      const existing = await this.tasksRepository.find({
+        where: { id: In(taskIds) },
+        select: ['id'],
+      });
+      const existingIds = existing.map(e => e.id);
+      const missing = taskIds.filter(id => !existingIds.includes(id));
 
-      const foundIds = tasks.map(t => t.id);
-      const missing = taskIds.filter(id => !foundIds.includes(id));
-
-      if (tasks.length > 0) {
-        for (const task of tasks) {
-          task.status = status;
-        }
-        await this.tasksRepository.save(tasks);
-        success.push(...foundIds);
+      if (existingIds.length) {
+        await this.tasksRepository
+          .createQueryBuilder()
+          .update(Task)
+          .set({ status })
+          .where('id IN (:...ids)', { ids: existingIds })
+          .execute();
+        success.push(...existingIds);
       }
 
-      for (const id of missing) {
-        failed.push({ id, error: 'Task not found' });
-      }
-
+      for (const id of missing) failed.push({ id, error: 'Task not found' });
       return { success, failed };
-    } catch (error: unknown) {
-      console.error('Error in batchUpdateStatus:', error);
+    } catch (error) {
+      this.logger.error('Error in batchUpdateStatus', error as Error);
       throw new InternalServerErrorException('Failed to update tasks in batch');
     }
   }
@@ -226,25 +274,25 @@ export class TasksService {
     const success: string[] = [];
     const failed: { id: string; error: string }[] = [];
 
+    if (!taskIds?.length) return { success, failed };
+
     try {
-      const result = await this.tasksRepository.delete(taskIds);
+      const existing = await this.tasksRepository.find({
+        where: { id: In(taskIds) },
+        select: ['id'],
+      });
+      const existingIds = existing.map(e => e.id);
+      const missing = taskIds.filter(id => !existingIds.includes(id));
 
-      if (result.affected && result.affected > 0) {
-        success.push(...taskIds);
+      if (existingIds.length) {
+        await this.tasksRepository.delete(existingIds);
+        success.push(...existingIds);
       }
 
-      if (!result.affected || result.affected < taskIds.length) {
-        // Some tasks not found
-        const deletedCount = result.affected || 0;
-        const notFound = taskIds.slice(deletedCount);
-        for (const id of notFound) {
-          failed.push({ id, error: 'Task not found' });
-        }
-      }
-
+      for (const id of missing) failed.push({ id, error: 'Task not found' });
       return { success, failed };
-    } catch (error: unknown) {
-      console.error('Error in batchRemove:', error);
+    } catch (error) {
+      this.logger.error('Error in batchRemove', error as Error);
       throw new InternalServerErrorException('Failed to delete tasks in batch');
     }
   }
@@ -257,45 +305,36 @@ export class TasksService {
     highPriority: number;
   }> {
     try {
-      // Total tasks
-      const total = await this.tasksRepository.count();
-
-      // Status counts in one grouped query
-      const statusCounts = await this.tasksRepository
-        .createQueryBuilder('task')
-        .select('task.status', 'status')
-        .addSelect('COUNT(task.id)', 'count')
-        .groupBy('task.status')
-        .getRawMany();
-
-      // Priority counts in one grouped query
-      const priorityCounts = await this.tasksRepository
-        .createQueryBuilder('task')
-        .select('task.priority', 'priority')
-        .addSelect('COUNT(task.id)', 'count')
-        .groupBy('task.priority')
-        .getRawMany();
-
-      // Map results into object
-      const statusMap: Record<string, number> = {};
-      statusCounts.forEach(row => {
-        statusMap[row.status] = Number(row.count);
-      });
-
-      const priorityMap: Record<string, number> = {};
-      priorityCounts.forEach(row => {
-        priorityMap[row.priority] = Number(row.count);
-      });
+      const raw = await this.tasksRepository
+        .createQueryBuilder('t')
+        .select('COUNT(*)', 'total')
+        .addSelect(`SUM(CASE WHEN t.status = :completed THEN 1 ELSE 0 END)`, 'completed')
+        .addSelect(`SUM(CASE WHEN t.status = :inProgress THEN 1 ELSE 0 END)`, 'inProgress')
+        .addSelect(`SUM(CASE WHEN t.status = :pending THEN 1 ELSE 0 END)`, 'pending')
+        .addSelect(`SUM(CASE WHEN t.priority = :high THEN 1 ELSE 0 END)`, 'highPriority')
+        .setParameters({
+          completed: TaskStatus.COMPLETED,
+          inProgress: TaskStatus.IN_PROGRESS,
+          pending: TaskStatus.PENDING,
+          high: TaskPriority.HIGH,
+        })
+        .getRawOne<{
+          total: string;
+          completed: string;
+          inProgress: string;
+          pending: string;
+          highPriority: string;
+        }>();
 
       return {
-        total,
-        completed: statusMap[TaskStatus.COMPLETED] || 0,
-        inProgress: statusMap[TaskStatus.IN_PROGRESS] || 0,
-        pending: statusMap[TaskStatus.PENDING] || 0,
-        highPriority: priorityMap[TaskPriority.HIGH] || 0,
+        total: Number(raw?.total ?? 0),
+        completed: Number(raw?.completed ?? 0),
+        inProgress: Number(raw?.inProgress ?? 0),
+        pending: Number(raw?.pending ?? 0),
+        highPriority: Number(raw?.highPriority ?? 0),
       };
     } catch (error) {
-      console.error('Error fetching task stats:', error);
+      this.logger.error('Error fetching task stats', error as Error);
       throw new InternalServerErrorException('Could not retrieve task statistics');
     }
   }

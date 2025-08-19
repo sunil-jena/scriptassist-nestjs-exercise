@@ -1,86 +1,140 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
-import { Module } from '@nestjs/common';
+import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { BullModule } from '@nestjs/bullmq';
 import { ThrottlerModule } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
+
 import { UsersModule } from './modules/users/users.module';
 import { TasksModule } from './modules/tasks/tasks.module';
 import { AuthModule } from './modules/auth/auth.module';
+
 import { TaskProcessorModule } from './queues/task-processor/task-processor.module';
 import { ScheduledTasksModule } from './queues/scheduled-tasks/scheduled-tasks.module';
+
+// Resilience & Observability
+import { HealthModule } from './health/health.module';
+import { MetricsModule } from './metrics/metrics.module';
+import { ResilientHttpModule } from './common/http/resilient-http.module';
+import { RequestContextService } from './common/request-context/request-context.service';
+import { RequestContextMiddleware } from './common/request-context/request-context.middleware';
+
+// (Optional) legacy cache service if used elsewhere
 import { CacheService } from './common/services/cache.service';
+import { AllExceptionsFilter } from '@common/filters/all-exceptions.filter';
+import { HttpExceptionFilter } from '@common/filters/http-exception.filter';
+import { APP_FILTER } from '@nestjs/core';
 
 @Module({
   imports: [
-    // Configuration
+    // -------- Config --------
     ConfigModule.forRoot({
       isGlobal: true,
     }),
 
-    // Database
+    // -------- Database (TypeORM) --------
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
+      useFactory: (config: ConfigService) => ({
         type: 'postgres',
-        host: configService.get('DB_HOST'),
-        port: configService.get('DB_PORT'),
-        username: configService.get('DB_USERNAME'),
-        password: configService.get('DB_PASSWORD'),
-        database: configService.get('DB_DATABASE'),
+        host: config.get<string>('DB_HOST'),
+        port: Number(config.get<number>('DB_PORT')),
+        username: config.get<string>('DB_USERNAME'),
+        password: config.get<string>('DB_PASSWORD'),
+        database: config.get<string>('DB_DATABASE'),
+        autoLoadEntities: true, // auto-load entities from feature modules
         entities: [__dirname + '/**/*.entity{.ts,.js}'],
-        synchronize: configService.get('NODE_ENV') === 'development',
-        logging: configService.get('NODE_ENV') === 'development',
+        synchronize: config.get('NODE_ENV') === 'development', // never enable in prod
+        logging: config.get('NODE_ENV') === 'development',
       }),
     }),
 
-    // Scheduling
+    // -------- Scheduling --------
     ScheduleModule.forRoot(),
 
-    // Queue
+    // -------- Queue (BullMQ / Redis) --------
     BullModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        connection: {
-          host: configService.get('REDIS_HOST'),
-          port: configService.get('REDIS_PORT'),
-        },
-      }),
+      useFactory: (config: ConfigService) => {
+        const url = config.get<string>('REDIS_URL');
+        const host = config.get<string>('REDIS_HOST') ?? '127.0.0.1';
+        const port = Number(config.get<number>('REDIS_PORT') ?? 6379);
+        const password = config.get<string>('REDIS_PASSWORD');
+
+        return {
+          connection: url
+            ? { url }
+            : {
+                host,
+                port,
+                ...(password ? { password } : {}),
+              },
+          // sensible defaults; tune as needed
+          defaultJobOptions: {
+            removeOnComplete: 1000,
+            removeOnFail: 1000,
+            attempts: 3,
+            backoff: {
+              type: 'exponential',
+              delay: 2000,
+            },
+          },
+        };
+      },
     }),
 
-    // Rate limiting
+    // -------- Rate limiting (controller-level via guard/decorator) --------
+    // NOTE: Throttler v5 supports array style; if you use older versions, convert accordingly.
     ThrottlerModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => [
+      useFactory: () => [
         {
-          ttl: 60,
-          limit: 10,
+          ttl: 60_000,
+          limit: 100,
         },
       ],
     }),
 
-    // Feature modules
+    // -------- Resilience & Observability --------
+    HealthModule, // /health/live, /health/ready
+    MetricsModule, // /metrics (Prometheus)
+    ResilientHttpModule, // Circuit breaker HTTP client
+
+    // -------- Feature modules --------
     UsersModule,
     TasksModule,
     AuthModule,
 
-    // Queue processing modules
+    // -------- Queue processing modules --------
     TaskProcessorModule,
     ScheduledTasksModule,
   ],
   providers: [
-    // Inefficient: Global cache service with no configuration options
-    // This creates a single in-memory cache instance shared across all modules
+    // Request context for per-request correlation/user id
+    RequestContextService,
+    {
+      provide: APP_FILTER,
+      useClass: HttpExceptionFilter, // handles HttpException
+    },
+    {
+      provide: APP_FILTER,
+      useFactory: (rctx: RequestContextService) => new AllExceptionsFilter(rctx),
+      inject: [RequestContextService],
+    },
+    // If other parts of the app still depend on this, keep it.
+    // Prefer replacing with a distributed cache (e.g., cache-manager + Redis) later.
     CacheService,
   ],
-  exports: [
-    // Exporting the cache service makes it available to other modules
-    // but creates tight coupling
-    CacheService,
-  ],
+  // Avoid exporting infra unless truly needed elsewhere
+  exports: [],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    // Attach correlation id & user id to ALS for every request
+    consumer.apply(RequestContextMiddleware).forRoutes('*');
+  }
+}
