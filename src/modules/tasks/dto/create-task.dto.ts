@@ -24,10 +24,15 @@ export class CreateTaskDto {
   @IsOptional()
   priority?: TaskPriority;
 
-  @ApiProperty({ example: '2023-12-31T23:59:59Z', required: false })
+  @ApiProperty({
+    example: '2023-12-31T23:59:59Z',
+    required: false,
+    format: 'date-time',
+    type: String,
+  })
   @IsDateString()
   @IsOptional()
-  dueDate?: Date;
+  dueDate?: string;
 
   @ApiProperty({ example: '123e4567-e89b-12d3-a456-426614174000' })
   @IsUUID()

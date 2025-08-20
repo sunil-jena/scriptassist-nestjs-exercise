@@ -21,6 +21,7 @@ import { ListTasksQuery } from './application/queries/list-tasks.query';
 import { GetTaskQuery } from './application/queries/get-task.query';
 import { GetTaskStatsQuery } from './application/queries/get-task-stats.query';
 import { TaskPriority } from './enums/task-priority.enum';
+import { parseISOToDateOrThrow } from '@common/utils/date';
 
 @ApiTags('tasks')
 @Controller('tasks')
@@ -33,12 +34,14 @@ export class TasksController {
   @Post()
   @ApiOperation({ summary: 'Create a new task' })
   async create(@Body() dto: CreateTaskDto) {
+
+      const dueDate = parseISOToDateOrThrow(dto.dueDate ?? null)
     return this.commandBus.execute(new CreateTaskCommand({
       title: dto.title,
       description: dto.description ?? null,
       priority: dto.priority ?? TaskPriority.MEDIUM,
       userId: dto.userId ?? null,
-      dueDate: dto.dueDate ?? null,
+      dueDate: dueDate,
       status: dto.status ?? TaskStatus.PENDING,
     }));
   }

@@ -17,9 +17,7 @@ import { TaskPriority } from '../enums/task-priority.enum';
 @Index('idx_tasks_priority', ['priority'])
 @Index('idx_tasks_user_id', ['userId'])
 @Index('idx_tasks_due_date', ['dueDate'])
-// Direction and specialized operators will be set in a migration:
 @Index('idx_tasks_created_at_id', ['createdAt', 'id'])
-// Helpful when filtering by status and sorting by createdAt:
 @Index('idx_tasks_status_created_at_id', ['status', 'createdAt', 'id'])
 export class Task {
   @PrimaryGeneratedColumn('uuid')

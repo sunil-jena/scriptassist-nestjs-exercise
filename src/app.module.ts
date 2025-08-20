@@ -100,10 +100,9 @@ import { APP_FILTER } from '@nestjs/core';
     }),
 
     // -------- Resilience & Observability --------
-    HealthModule, // /health/live, /health/ready
-    MetricsModule, // /metrics (Prometheus)
-    ResilientHttpModule, // Circuit breaker HTTP client
-
+    HealthModule,
+    MetricsModule,
+    ResilientHttpModule,
     // -------- Feature modules --------
     UsersModule,
     TasksModule,
@@ -118,7 +117,7 @@ import { APP_FILTER } from '@nestjs/core';
     RequestContextService,
     {
       provide: APP_FILTER,
-      useClass: HttpExceptionFilter, // handles HttpException
+      useClass: HttpExceptionFilter,
     },
     {
       provide: APP_FILTER,

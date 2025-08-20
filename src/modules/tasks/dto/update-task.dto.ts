@@ -28,5 +28,5 @@ export class UpdateTaskDto extends PartialType(CreateTaskDto) {
   @ApiPropertyOptional({ example: '2025-12-31T23:59:59Z' })
   @IsDateString()
   @IsOptional()
-  dueDate?: Date;
+  dueDate?: string;
 }
